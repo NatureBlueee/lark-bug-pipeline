@@ -16,12 +16,14 @@
 
 | scope | 用途 |
 |---|---|
-| `im:message` | 收/发消息 |
+| `im:message` | 收/发消息，同时用于下载用户发的图片/文件附件 |
 | `im:message.group_at_msg` | 收群里 @bot 的消息 |
 | `im:message:send_as_bot` | 以 bot 身份回消息 |
 
 改完要点「发布版本」→ 审核通过后 scope 才生效。
 
+> **多模态附件**（v0.2+）：用户 @bot 时可以直接甩截图或文件，daemon 自动下载到 `~/.towow/attachments/<message_id>/`，triage 阶段 Claude Code 原生读图定位 UI 错误。如果下载附件报 401，在「权限管理」额外补开 `im:resource`（极少数飞书租户需要这个单独 scope）。
+>
 > 如果之后想升级到多维表格路径，再额外开 `bitable:app`，见附录 A。
 
 ## 3. 开启事件订阅

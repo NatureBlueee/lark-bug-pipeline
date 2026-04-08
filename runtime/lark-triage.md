@@ -61,11 +61,35 @@ related_adr:
       "name": "张三",
       "user_id": "ou_xxxxxxxx"
     }
-  }
+  },
+  "attachments": [
+    {
+      "kind": "image",
+      "path": "/Users/nature/.towow/attachments/om_xxx/0.png",
+      "original_name": "",
+      "source_key": "img_v2_xxx"
+    }
+  ]
 }
 ```
 
 `场景` 字段告诉我应该在哪个目录优先 trace。
+
+### 附件（attachments）处理规则
+
+如果 `attachments` 非空，**在 Step 1 定位之前**必须：
+
+1. 用 `Read` 工具读每一个 `path`（本地绝对路径，已经下载到 `~/.towow/attachments/<msg_id>/`）。Claude Code 原生支持图片读取，可以看到截图内容——利用它定位是什么页面 / 什么错误码 / 什么 UI 状态
+2. 把从截图里看到的关键信息（页面名/错误文案/URL/报错码）**写进"## 用户原话"之后的"## 从截图里看到"段**——这比用户文字更可靠，后续 fixer 会拿它作为 ground truth
+3. 在 issue 文档正文最后加一个 `## 附件` section，按原顺序引用每个附件：
+   ```markdown
+   ## 附件
+
+   - 截图 1：`/Users/nature/.towow/attachments/om_xxx/0.png`（用户原始截图）
+   - 文件 1：`/Users/nature/.towow/attachments/om_xxx/1.log`（用户上传日志）
+   ```
+
+如果只有附件没有文字（daemon 会填一个占位"用户只发了 N 个附件"），**截图就是主要信号**，必须先 Read 再判断 escalation——不得因为"症状字段像占位符"就直接 out_of_scope。
 
 ## 输出
 
@@ -156,6 +180,8 @@ escalation: auto                   # auto / needs_nature / needs_user_clarificat
 ### Step 0: 解析输入
 
 读取 worker 传给我的 record JSON。验证必填字段（症状、复现步骤、场景）。任一缺失 → 标 `out_of_scope`，**停止**。
+
+**附件降级豁免**：如果 `attachments` 非空，即便 `症状` 字段看起来像占位符（如"用户只发了 1 个附件，无文字说明"），**不**直接 out_of_scope——先按上面「附件处理规则」Read 所有图片附件，从截图里提取实际症状再做判断。截图本身就是有效输入。
 
 **`out_of_scope` 路径硬约束**：
 - **不得** 创建 `docs/issues/lark-*.md` 草稿。理由：issue 是给 guardian-fixer 消费的，out_of_scope 永远不会被 fixer 看到，写草稿只会污染 `docs/issues/` 目录 + 之后需要手动清理。

@@ -1,6 +1,6 @@
 # lark-bug-pipeline
 
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/NatureBlueee/lark-bug-pipeline/releases)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/NatureBlueee/lark-bug-pipeline/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-purple)](https://claude.com/claude-code)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/NatureBlueee/lark-bug-pipeline/pulls)
@@ -19,6 +19,7 @@
 ## What you get
 
 - 📥 **用户反馈零门槛**：飞书群 @bot 一句话，不用填表、不用提 issue、不用翻文档
+- 🖼️ **多模态输入**（v0.2）：支持纯文字 / 富文本 / 纯图片 / 文件附件——用户直接甩截图，Claude Code 原生读图定位 UI 错误
 - 🧠 **8 Gate 闭环修复**：triage → PLAN → REVIEW → TASK → REVIEW → IMPL → TEST → FINAL-REVIEW → CLOSURE，每步 artifact 可回溯
 - 🚀 **端到端 ~15 分钟**：bug 话音落地到 PR 链接回到飞书群
 - 💸 **$0 API 成本**：走你本地的 Claude Code Max/Pro 订阅，不走 Anthropic API billing

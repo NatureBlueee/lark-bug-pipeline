@@ -111,6 +111,8 @@ DAEMON_OUTBOX = TOWOW_DIR / "daemon-outbox"
 OUTBOX_FAILED = TOWOW_DIR / "daemon-outbox-failed"
 DAEMON_LOG = TOWOW_DIR / "lark-daemon.log"
 ENV_FILE = TOWOW_DIR / ".env.lark"
+# 附件（图片/文件）落盘根目录，按 message_id 分子目录
+ATTACHMENTS_DIR = TOWOW_DIR / "attachments"
 
 # outbox 单条消息最多重试几次，超过移到 failed/
 MAX_OUTBOX_RETRIES = 5
@@ -353,6 +355,180 @@ def _extract_im_text(content_raw: str | None) -> str:
     return _MENTION_PLACEHOLDER_RE.sub("", text).strip()
 
 
+def _extract_post_content(content_raw: str | None) -> tuple[str, list[dict]]:
+    """解析飞书富文本 (post) 消息。
+
+    post content 典型结构：
+      {"title": "...", "content": [[{"tag":"text","text":"按钮坏了"},
+                                     {"tag":"img","image_key":"img_v2_xxx"}]]}
+
+    返回 (纯文本, 图片/文件 ref list)。ref 形如
+      {"kind": "image", "key": "img_v2_xxx"}
+      {"kind": "file",  "key": "file_xxx", "name": "error.log"}
+    """
+    if not content_raw:
+        return "", []
+    try:
+        parsed = json.loads(content_raw)
+    except Exception:
+        return content_raw.strip(), []
+
+    title = parsed.get("title", "") or ""
+    texts: list[str] = []
+    if title:
+        texts.append(title)
+
+    refs: list[dict] = []
+    content = parsed.get("content", [])
+    if not isinstance(content, list):
+        return _MENTION_PLACEHOLDER_RE.sub("", " ".join(texts)).strip(), refs
+
+    for line in content:
+        if not isinstance(line, list):
+            continue
+        for element in line:
+            if not isinstance(element, dict):
+                continue
+            tag = element.get("tag")
+            if tag in ("text", "a", "at", "code_inline"):
+                t = element.get("text") or element.get("href") or ""
+                if isinstance(t, str) and t:
+                    texts.append(t)
+            elif tag == "img":
+                key = element.get("image_key")
+                if key:
+                    refs.append({"kind": "image", "key": key})
+            elif tag == "media":
+                # 视频/文件
+                key = element.get("file_key") or element.get("image_key")
+                if key:
+                    refs.append({"kind": "file", "key": key, "name": element.get("file_name") or ""})
+        texts.append("\n")
+
+    joined = _MENTION_PLACEHOLDER_RE.sub("", "".join(texts)).strip()
+    return joined, refs
+
+
+def _extract_image_key(content_raw: str | None) -> str | None:
+    """纯图片消息的 content：{"image_key": "img_v2_xxx"}"""
+    if not content_raw:
+        return None
+    try:
+        parsed = json.loads(content_raw)
+    except Exception:
+        return None
+    key = parsed.get("image_key")
+    return key if isinstance(key, str) else None
+
+
+def _extract_file_info(content_raw: str | None) -> tuple[str | None, str]:
+    """文件消息的 content：{"file_key":"file_xxx","file_name":"xxx.log","file_size":N}"""
+    if not content_raw:
+        return None, ""
+    try:
+        parsed = json.loads(content_raw)
+    except Exception:
+        return None, ""
+    key = parsed.get("file_key")
+    name = parsed.get("file_name") or ""
+    return (key if isinstance(key, str) else None), name
+
+
+def _download_message_resource(
+    rest_client: Any,
+    message_id: str,
+    file_key: str,
+    resource_type: str,
+    save_path: Path,
+) -> bool:
+    """用 lark-oapi SDK 下载某条消息的附件（image 或 file）到 save_path。
+
+    resource_type: "image" | "file"
+    成功返回 True，失败返回 False（失败不抛出，调用方决定是否降级）。
+
+    lark-oapi 的 API 路径：
+      POST 不是，是 GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}
+      SDK: lark_oapi.api.im.v1.GetMessageResourceRequest
+           client.im.v1.message.get(request)  →  返回 BinaryIO
+    """
+    if rest_client is None:
+        logging.warning("[IM] rest_client 未初始化，跳过附件下载 key=%s", file_key)
+        return False
+    try:
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        req = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type(resource_type)
+            .build()
+        )
+        resp = rest_client.im.v1.message_resource.get(req)
+        if not resp.success():
+            logging.warning(
+                "[IM] 下载附件失败 key=%s code=%s msg=%s",
+                file_key, getattr(resp, "code", "?"), getattr(resp, "msg", "?"),
+            )
+            return False
+        # 返回的 file 是 BytesIO / file-like
+        file_obj = getattr(resp, "file", None)
+        if file_obj is None:
+            logging.warning("[IM] 下载附件无 body key=%s", file_key)
+            return False
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        data = file_obj.read() if hasattr(file_obj, "read") else bytes(file_obj)
+        save_path.write_bytes(data)
+        return True
+    except Exception:
+        logging.exception("[IM] 下载附件异常 key=%s type=%s", file_key, resource_type)
+        return False
+
+
+def _guess_extension(resource_type: str, original_name: str) -> str:
+    """根据 resource_type 和原始文件名推测扩展名。"""
+    if original_name and "." in original_name:
+        return "." + original_name.rsplit(".", 1)[-1].lower()
+    return ".png" if resource_type == "image" else ".bin"
+
+
+def _materialize_attachments(
+    rest_client: Any,
+    message_id: str,
+    refs: list[dict],
+) -> list[dict]:
+    """把 refs（来自消息 content 的 image_key/file_key 列表）下载落盘。
+
+    返回 entry.attachments 的 list，元素形如：
+      {"kind": "image", "path": "/Users/.../attachments/om_xxx/0.png",
+       "original_name": "", "source_key": "img_v2_xxx"}
+    """
+    if not refs:
+        return []
+    result: list[dict] = []
+    msg_dir = ATTACHMENTS_DIR / message_id
+    for i, ref in enumerate(refs):
+        kind = ref.get("kind", "image")
+        key = ref.get("key")
+        if not key:
+            continue
+        original_name = ref.get("name", "")
+        ext = _guess_extension(kind, original_name)
+        save_path = msg_dir / f"{i}{ext}"
+        ok = _download_message_resource(
+            rest_client, message_id, key, kind, save_path,
+        )
+        if not ok:
+            continue
+        result.append({
+            "kind": kind,
+            "path": str(save_path),
+            "original_name": original_name,
+            "source_key": key,
+        })
+    return result
+
+
 def _is_message_for_bot(mentions: list[Any], bot_open_id: str) -> bool:
     """判断消息里是否 @ 了我们这个 bot。
 
@@ -432,8 +608,8 @@ def make_im_handler(state: DaemonState):
                 return
 
             message_type = getattr(message, "message_type", None)
-            if message_type != "text":
-                # 后续可扩展到 post/rich-text，当前只处理纯文本
+            SUPPORTED_TYPES = {"text", "post", "image", "file"}
+            if message_type not in SUPPORTED_TYPES:
                 logging.info("[IM] 暂不支持的消息类型 %s，忽略", message_type)
                 return
 
@@ -447,10 +623,36 @@ def make_im_handler(state: DaemonState):
                 logging.warning("[IM] 缺少 message_id/chat_id，跳过")
                 return
 
-            text = _extract_im_text(content_raw)
-            if not text:
-                logging.info("[IM] 消息文本为空（可能只 @ 没内容），跳过")
+            # 按消息类型抽取 text + refs
+            text = ""
+            refs: list[dict] = []
+            if message_type == "text":
+                text = _extract_im_text(content_raw)
+            elif message_type == "post":
+                text, refs = _extract_post_content(content_raw)
+            elif message_type == "image":
+                key = _extract_image_key(content_raw)
+                if key:
+                    refs.append({"kind": "image", "key": key})
+            elif message_type == "file":
+                key, name = _extract_file_info(content_raw)
+                if key:
+                    refs.append({"kind": "file", "key": key, "name": name})
+
+            # 文本 + 附件都空时才跳过（纯 @ 无内容）
+            if not text and not refs:
+                logging.info("[IM] 消息为空（无文本无附件），跳过")
                 return
+
+            # 下载附件到 ~/.towow/attachments/<message_id>/
+            attachments = _materialize_attachments(
+                state.rest_client, message_id, refs,
+            )
+
+            # 如果只有附件没有文字，给 triage 一个友好占位
+            if not text and attachments:
+                kinds = [a["kind"] for a in attachments]
+                text = f"（用户只发了 {len(attachments)} 个附件，无文字说明：{', '.join(kinds)}）"
 
             entry = {
                 "record_id": message_id,
@@ -468,14 +670,16 @@ def make_im_handler(state: DaemonState):
                     "message_id": message_id,
                     "sender_open_id": sender_open_id,
                     "chat_type": chat_type,
+                    "message_type": message_type,
                     "raw_text": content_raw or "",
                 },
+                "attachments": attachments,
             }
             append_to_queue(entry)
             logging.info(
-                "[上行 IM] msg=%s chat=%s sender=%s text=%r",
-                message_id, chat_id[:12] + "...", sender_open_id,
-                text[:80],
+                "[上行 IM] msg=%s type=%s chat=%s sender=%s text=%r attachments=%d",
+                message_id, message_type, chat_id[:12] + "...", sender_open_id,
+                text[:80], len(attachments),
             )
         except Exception:
             logging.exception("im handler 异常")

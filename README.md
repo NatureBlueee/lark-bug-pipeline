@@ -1,27 +1,43 @@
 # lark-bug-pipeline
 
-> 飞书群 @bot 发一句 bug → 15 分钟后 GitHub 上自动开好 PR。  
-> Feishu (Lark) group chat bug report → auto PR on GitHub in 15 minutes. Zero API cost.
+[![version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/NatureBlueee/lark-bug-pipeline/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-purple)](https://claude.com/claude-code)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/NatureBlueee/lark-bug-pipeline/pulls)
 
-一个可以直接扔进任何 Claude Code 项目的 skill。装好之后，你的用户在飞书群里 @bot 说一句"登录按钮点了没反应"，Mac 本地两个 launchd 常驻进程会捡起来，跑 Claude Code headless triage + guardian-fixer 8 Gate 修复流程，最后 `gh pr create` 自动开 PR。
+> **飞书群 @bot 发一句 bug → 15 分钟后 GitHub 上自动开好 PR。**
+> Feishu (Lark) group chat bug report → auto PR on GitHub in ~15 minutes. **$0 API cost.**
 
-**全程走 Claude Max / Pro 订阅，不走 API，$0 边际成本。**
+真实证据：首个真用户反馈的完整闭环 PR 👉 [NatureBlueee/Towow#90](https://github.com/NatureBlueee/Towow/pull/90) （triage 2min · fixer 6.7min · 端到端 ~15min）
+
+<p align="center">
+  <img src="docs/assets/demo-collage.png" alt="飞书群 @bot → 终端日志 → GitHub PR" width="720">
+  <br>
+  <sub>左：用户在飞书群 @bot 报 bug ｜ 中：本地 daemon 日志 ｜ 右：自动生成的 PR</sub>
+</p>
+
+## What you get
+
+- 📥 **用户反馈零门槛**：飞书群 @bot 一句话，不用填表、不用提 issue、不用翻文档
+- 🧠 **8 Gate 闭环修复**：triage → PLAN → REVIEW → TASK → REVIEW → IMPL → TEST → FINAL-REVIEW → CLOSURE，每步 artifact 可回溯
+- 🚀 **端到端 ~15 分钟**：bug 话音落地到 PR 链接回到飞书群
+- 💸 **$0 API 成本**：走你本地的 Claude Code Max/Pro 订阅，不走 Anthropic API billing
+
+## 成本对比
+
+| 方案 | 单个 PR 成本 | 运行位置 | 开发能力 |
+|---|---|---|---|
+| Sweep AI | ~$0.20 / PR | 云端沙箱 | 受沙箱能力限制 |
+| Codegen | 订阅制（$$$） | 云端容器 | 受容器能力限制 |
+| **lark-bug-pipeline** | **$0**（走订阅） | **本地 Claude Code** | **= 完整 Claude Code 能力** |
+
+> **为什么本地 Claude Code 更强**：不需要容器化、能直接访问你的开发环境 / IDE / toolchain / MCP servers / 已登录的 gh 和数据库连接。修复范围不被沙箱边界切掉。
 
 ---
 
 ## 5 分钟装完
 
-前置：macOS + `python3` + [Claude Code](https://claude.com/claude-code) CLI 已登录 + 一个 GitHub 仓库。
-
-### 🤖 方法 A：让你的 AI 自己装（推荐）
-
-在任何 Claude Code session 里说一句：
-
-> 帮我装 lark-bug-pipeline，仓库在 https://github.com/NatureBlueee/lark-bug-pipeline
-
-Claude 会自己读这个 README、跑 bootstrap、然后按 skill 里的「AI 指导模式」一步步问你飞书配置、帮你开 scope、告诉你 bot open_id 去哪抄。全程你只负责回答问题和粘贴 App ID。
-
-### 🐚 方法 B：一行 shell
+前置：macOS + `python3` + [Claude Code](https://claude.com/claude-code) CLI 已登录 + 一个 GitHub 仓库 + `guardian-fixer` skill（[详情](#依赖--硬性前提)）。
 
 ```bash
 cd <your-repo>   # 必须在 git 仓库里
@@ -30,7 +46,20 @@ curl -fsSL https://raw.githubusercontent.com/NatureBlueee/lark-bug-pipeline/main
 
 然后按脚本打印的 3 步做完：复制 env 模板 → 填 4 个变量 → `bash .claude/skills/lark-bug-pipeline/install.sh`。
 
-### 📦 方法 C：手动
+装完之后在飞书群 @bot 发一条 bug，~15 分钟后去 GitHub 看 PR。
+
+<details>
+<summary>🤖 或者：让你的 AI 自己装</summary>
+
+在任何 Claude Code session 里说一句：
+
+> 帮我装 lark-bug-pipeline，仓库在 https://github.com/NatureBlueee/lark-bug-pipeline
+
+Claude 会自己读这个 README、跑 bootstrap、然后按 skill 里的「AI 指导模式」一步步问你飞书配置、帮你开 scope、告诉你 bot open_id 去哪抄。全程你只负责回答问题和粘贴 App ID。
+</details>
+
+<details>
+<summary>📦 或者：手动 git clone</summary>
 
 ```bash
 git clone https://github.com/NatureBlueee/lark-bug-pipeline .claude/skills/lark-bug-pipeline
@@ -40,8 +69,7 @@ cp .claude/skills/lark-bug-pipeline/templates/env.lark.example ~/.towow/.env.lar
 $EDITOR ~/.towow/.env.lark     # 填 LARK_APP_ID / APP_SECRET / BOT_OPEN_ID / NATURE_OPEN_ID
 bash .claude/skills/lark-bug-pipeline/install.sh
 ```
-
-装完之后在飞书群 @bot 发一条 bug，15 分钟后去 GitHub 看 PR。
+</details>
 
 ---
 
@@ -79,31 +107,41 @@ bash .claude/skills/lark-bug-pipeline/install.sh
 
 ## 架构一眼图
 
-```
-飞书群 @bot                      ~/.towow/queue/                 git worktree
-   │                                   ▲                              │
-   │ im.message.receive_v1              │ atomic JSONL append          ▼
-   ▼                                   │                         docs/issues/
-bug_daemon.py (LaunchAgent #1) ────────┘                         lark-<ts>-<slug>.md
-   │                                                                   ▲
-   │ 纯 I/O，永不调 LLM                                                  │
-   ▼                                                                   │
-[30s poll]                                                             │
-   │                                                                   │
-   ▼                                                                   │
-bug_worker.py (LaunchAgent #2) ─── spawn ──▶ claude -p --skill lark-triage
-   │                                              │
-   │                                              ▼ (state file 权威 > exit code)
-   │ 读 state file 路由                          {escalation, bundle_key,
-   │                                              severity, issue_path}
-   ▼
-claude -p --skill guardian-fixer (8 Gate)
-   │
-   ▼
-gh pr create ─────▶ GitHub PR ─────▶ 回帖飞书群附 PR 链接
+```mermaid
+sequenceDiagram
+    participant U as 飞书群用户
+    participant D as bug_daemon<br/>(LaunchAgent #1)
+    participant Q as ~/.towow/queue/<br/>JSONL
+    participant W as bug_worker<br/>(LaunchAgent #2)
+    participant T as claude -p<br/>lark-triage
+    participant F as claude -p<br/>guardian-fixer (8 Gate)
+    participant G as GitHub
+
+    U->>D: @bot 报 bug
+    D->>Q: atomic append<br/>(纯 I/O, 永不调 LLM)
+    loop 每 30s
+        W->>Q: poll
+    end
+    W->>T: spawn headless
+    T->>T: 写 state file<br/>(escalation/bundle_key/severity)
+    T-->>W: state file > exit code
+    W->>F: spawn with bundle worktree
+    F->>F: PLAN → REVIEW → TASK → REVIEW<br/>→ IMPL → TEST → FINAL → CLOSURE
+    F->>G: gh pr create
+    G-->>U: PR 链接回帖飞书群
 ```
 
 细节见 `docs/architecture.md`。
+
+---
+
+## 🔒 安全与信任边界
+
+- **只开 PR，从不推 main**：所有产出走标准 PR review flow，你保留最终合并权
+- **从不 force-push**：fixer worktree 独立分支，不动历史
+- **本地运行，无云端代码上传**：Claude Code 在你的 Mac 上跑，代码不离开你的开发机（Anthropic 服务只看到 prompt，不看到仓库快照）
+- **最小权限飞书 scope**：默认只需要 `im:message` / `im:message.group_at_msg` / `im:message:send_as_bot`，不读历史、不读联系人
+- **环境变量在 `~/.towow/.env.lark`**：不进仓库、不进 git history
 
 ---
 

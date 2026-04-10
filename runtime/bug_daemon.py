@@ -646,7 +646,7 @@ def make_im_handler(state: DaemonState):
 
             # 下载附件到 ~/.towow/attachments/<message_id>/
             attachments = _materialize_attachments(
-                state.rest_client, message_id, refs,
+                state.rest, message_id, refs,
             )
 
             # 如果只有附件没有文字，给 triage 一个友好占位

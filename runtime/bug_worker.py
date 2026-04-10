@@ -61,6 +61,7 @@ WORKER_STATE = TOWOW_DIR / "worker.state.json"
 DAEMON_OUTBOX = TOWOW_DIR / "daemon-outbox"  # worker → daemon 消息目录
 PROCESSED_LOG = TOWOW_DIR / "processed-records.jsonl"
 FLUSH_SIGNAL = TOWOW_DIR / "flush-queue.signal"  # daemon 写入，worker 消费后删除
+TRIAGE_SESSIONS_DIR = TOWOW_DIR / "triage-sessions"  # p2p session 追踪
 WORKTREE_BASE = Path("/tmp")
 
 # ADR-040 D2: 批处理触发器参数
@@ -838,11 +839,13 @@ def reply_to_user_in_bitable(record_id: str, message: str) -> None:
     update_bitable(record_id, {"AI 备注": message})
 
 
-def notify_nature(text: str) -> None:
+def notify_nature(text: str, *, record_id: str = "") -> None:
     """私聊 Nature。需要 LARK_NATURE_OPEN_ID 已配置。
 
     没配的时候不报错——只 log 一行 warning，让 worker 在 daemon 还没启用
     真飞书前（dry-run / 用户尚未完成 task #2）也能正常跑完整批处理流程。
+
+    record_id 非空时写 triage-session 文件，daemon 据此接收 p2p 回复。
     """
     nature_open_id = os.environ.get("LARK_NATURE_OPEN_ID", "").strip()
     if not nature_open_id:
@@ -858,6 +861,17 @@ def notify_nature(text: str) -> None:
         msg_type="text",
         text=text,
     )
+    # 写 triage session 文件，让 daemon 知道 Nature 有 pending 决策
+    if record_id:
+        TRIAGE_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        session_file = TRIAGE_SESSIONS_DIR / f"{record_id}.json"
+        session_file.write_text(json.dumps({
+            "record_id": record_id,
+            "open_id": nature_open_id,
+            "notified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "status": "pending",
+        }, ensure_ascii=False), encoding="utf-8")
+        logging.info("Triage session created: %s -> %s", record_id, session_file.name)
 
 
 # ------------------------------------------------------------------------------
@@ -1077,7 +1091,8 @@ def process_batch(entries: list[QueueEntry], cfg: dict) -> None:
             notify_nature(
                 r.feishu_message_for_nature
                 or f"Triage 标 needs_nature：{r.record_id}\n"
-                f"症状：{(entry.fields.get('症状', '?') if entry else '?')}"
+                f"症状：{(entry.fields.get('症状', '?') if entry else '?')}",
+                record_id=r.record_id,
             )
 
         mark_processed(

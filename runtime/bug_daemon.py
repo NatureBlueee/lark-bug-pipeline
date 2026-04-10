@@ -115,6 +115,10 @@ ENV_FILE = TOWOW_DIR / ".env.lark"
 ATTACHMENTS_DIR = TOWOW_DIR / "attachments"
 # flush 信号文件：用户确认"没了/开始修"时写入，worker 看到后跳过 debounce
 FLUSH_SIGNAL = TOWOW_DIR / "flush-queue.signal"
+# triage session 追踪目录（worker 写入，daemon 读取）
+TRIAGE_SESSIONS_DIR = TOWOW_DIR / "triage-sessions"
+# p2p 回复关联的 session 过期时间（秒），超过不再关联
+TRIAGE_SESSION_TTL = 86400  # 24 小时
 
 # 默认 debounce 秒数（与 worker DEFAULTS 保持一致，用于回复提示）
 DEFAULTS_DEBOUNCE = 600
@@ -129,6 +133,63 @@ _FLUSH_TRIGGERS = frozenset({
 MAX_OUTBOX_RETRIES = 5
 # outbox 轮询间隔（秒）
 OUTBOX_POLL_INTERVAL = 2
+
+
+# ---------------------------------------------------------------------------
+# Triage session 追踪（p2p 回复关联）
+# ---------------------------------------------------------------------------
+
+
+def _find_pending_session(sender_open_id: str) -> dict | None:
+    """查找该用户是否有 pending 的 triage session（worker 写入的文件）。
+
+    返回最新的 pending session dict 或 None。
+    """
+    if not TRIAGE_SESSIONS_DIR.is_dir():
+        return None
+    now = datetime.now().astimezone()
+    best: dict | None = None
+    best_time = ""
+    for f in TRIAGE_SESSIONS_DIR.iterdir():
+        if not f.suffix == ".json":
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("open_id") != sender_open_id:
+            continue
+        if data.get("status") != "pending":
+            continue
+        # 检查过期
+        notified = data.get("notified_at", "")
+        if notified:
+            from datetime import timezone
+            try:
+                t = datetime.fromisoformat(notified)
+                if (now - t).total_seconds() > TRIAGE_SESSION_TTL:
+                    continue
+            except ValueError:
+                pass
+        if notified > best_time:
+            best = data
+            best_time = notified
+    return best
+
+
+def _close_triage_session(record_id: str) -> None:
+    """标记 triage session 为 replied。"""
+    session_file = TRIAGE_SESSIONS_DIR / f"{record_id}.json"
+    if session_file.exists():
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+            data["status"] = "replied"
+            data["replied_at"] = datetime.now().astimezone().isoformat()
+            session_file.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8",
+            )
+        except Exception:
+            logging.exception("close triage session failed: %s", record_id)
 
 
 # ---------------------------------------------------------------------------
@@ -608,15 +669,32 @@ def make_im_handler(state: DaemonState):
                 return
 
             chat_type = getattr(message, "chat_type", None)
-            # 只收群聊 @bot，p2p 私聊暂不处理（避免和 notify_nature 回环）
-            if chat_type != "group":
-                logging.debug("[IM] 忽略非群聊消息 chat_type=%s", chat_type)
-                return
+            sender_id_obj = getattr(sender, "sender_id", None)
+            sender_open_id = getattr(sender_id_obj, "open_id", None) if sender_id_obj else None
 
-            mentions = getattr(message, "mentions", None) or []
-            if not _is_message_for_bot(mentions, bot_open_id):
-                logging.debug("[IM] 群聊消息未 @bot，忽略")
-                return
+            # p2p 私聊：仅当发送者有 pending triage session 时接收
+            if chat_type != "group":
+                if not sender_open_id:
+                    return
+                session = _find_pending_session(sender_open_id)
+                if session is None:
+                    logging.debug(
+                        "[IM] p2p 消息无 pending session sender=%s，忽略",
+                        sender_open_id,
+                    )
+                    return
+                logging.info(
+                    "[IM] p2p 回复关联 triage session: sender=%s record=%s",
+                    sender_open_id, session.get("record_id"),
+                )
+                # 走下面的通用消息处理流程，entry 会带 reply_to 标记
+            else:
+                # 群聊：必须 @bot
+                mentions = getattr(message, "mentions", None) or []
+                if not _is_message_for_bot(mentions, bot_open_id):
+                    logging.debug("[IM] 群聊消息未 @bot，忽略")
+                    return
+                session = None
 
             message_type = getattr(message, "message_type", None)
             SUPPORTED_TYPES = {"text", "post", "image", "file"}
@@ -627,8 +705,7 @@ def make_im_handler(state: DaemonState):
             message_id = getattr(message, "message_id", None)
             chat_id = getattr(message, "chat_id", None)
             content_raw = getattr(message, "content", None)
-            sender_id_obj = getattr(sender, "sender_id", None)
-            sender_open_id = getattr(sender_id_obj, "open_id", None) if sender_id_obj else None
+            # sender_open_id 已在上方 p2p/group 分支中提取
 
             if not message_id or not chat_id:
                 logging.warning("[IM] 缺少 message_id/chat_id，跳过")
@@ -682,7 +759,7 @@ def make_im_handler(state: DaemonState):
             entry = {
                 "record_id": message_id,
                 "received_at": datetime.now().astimezone().isoformat(),
-                "source": "lark-im",
+                "source": "lark-im-reply" if session else "lark-im",
                 "fields": {
                     "症状": text,
                     "复现步骤": "",
@@ -691,7 +768,7 @@ def make_im_handler(state: DaemonState):
                     "提交人": sender_open_id or "",
                 },
                 "im": {
-                    "chat_id": chat_id,
+                    "chat_id": chat_id or "",
                     "message_id": message_id,
                     "sender_open_id": sender_open_id,
                     "chat_type": chat_type,
@@ -700,6 +777,10 @@ def make_im_handler(state: DaemonState):
                 },
                 "attachments": attachments,
             }
+            # p2p 回复：关联原 triage record + 关闭 session
+            if session:
+                entry["reply_to"] = session["record_id"]
+                _close_triage_session(session["record_id"])
             append_to_queue(entry)
             logging.info(
                 "[上行 IM] msg=%s type=%s chat=%s sender=%s text=%r attachments=%d",
@@ -708,16 +789,31 @@ def make_im_handler(state: DaemonState):
             )
 
             # ── 自动确认回复 ──
-            debounce_min = int(DEFAULTS_DEBOUNCE / 60)
-            reply_im_message(state, {
-                "kind": "im_reply",
-                "message_id": message_id,
-                "text": (
-                    f"收到反馈！如果还有补充可以继续发。\n"
-                    f"回复「开始修」立即处理，"
-                    f"不回复则 {debounce_min} 分钟后自动开始。"
-                ),
-            })
+            if session:
+                # p2p 决策回复：确认收到 + 立即触发处理
+                reply_im_message(state, {
+                    "kind": "im_reply",
+                    "message_id": message_id,
+                    "text": (
+                        f"收到决策！已关联到原反馈 {session['record_id'][:20]}…\n"
+                        f"马上安排处理 🔧"
+                    ),
+                })
+                # 写 flush 信号，让 worker 立即触发
+                FLUSH_SIGNAL.write_text(
+                    datetime.now().astimezone().isoformat(), encoding="utf-8",
+                )
+            else:
+                debounce_min = int(DEFAULTS_DEBOUNCE / 60)
+                reply_im_message(state, {
+                    "kind": "im_reply",
+                    "message_id": message_id,
+                    "text": (
+                        f"收到反馈！如果还有补充可以继续发。\n"
+                        f"回复「开始修」立即处理，"
+                        f"不回复则 {debounce_min} 分钟后自动开始。"
+                    ),
+                })
         except Exception:
             logging.exception("im handler 异常")
 
